@@ -1,6 +1,6 @@
 module zara-files
 
-go 1.23.4
+go 1.23
 
 require (
 	github.com/bytedance/sonic v1.12.7 // indirect
