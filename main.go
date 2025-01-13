@@ -5,11 +5,13 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/gin-contrib/cors"
@@ -69,8 +71,56 @@ func unpad(data []byte) ([]byte, error) {
 	return data[:length-padding], nil
 }
 
-// uploadEncrypt handles file encryption
-func uploadEncrypt(c *gin.Context) {
+// Encrypt encrypts data using AES-256-CBC with a random IV
+func encrypt(data, key []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate random IV
+	iv, err := generateRandomBytes(aes.BlockSize)
+	if err != nil {
+		return nil, err
+	}
+
+	paddedData := pad(data)
+	ciphertext := make([]byte, len(paddedData)+aes.BlockSize) // IV + ciphertext
+	copy(ciphertext[:aes.BlockSize], iv)
+
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(ciphertext[aes.BlockSize:], paddedData)
+
+	return ciphertext, nil
+}
+
+// Decrypt decrypts data using AES-256-CBC
+func decrypt(data, key []byte) ([]byte, error) {
+	if len(data) < aes.BlockSize {
+		return nil, errors.New("ciphertext too short")
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	iv := data[:aes.BlockSize]
+	ciphertext := data[aes.BlockSize:]
+
+	if len(ciphertext)%aes.BlockSize != 0 {
+		return nil, errors.New("ciphertext is not a multiple of block size")
+	}
+
+	mode := cipher.NewCBCDecrypter(block, iv)
+	plaintext := make([]byte, len(ciphertext))
+	mode.CryptBlocks(plaintext, ciphertext)
+
+	return unpad(plaintext)
+}
+
+// File handlers
+func encryptFile(c *gin.Context) {
 	password := c.GetHeader("X-Encryption-Password")
 	if password == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "encryption password required"})
@@ -83,6 +133,11 @@ func uploadEncrypt(c *gin.Context) {
 		return
 	}
 
+	if file.Size > 100*1024*1024 { // 50MB limit
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file too large"})
+		return
+	}
+
 	src, err := file.Open()
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unable to open file"})
@@ -90,102 +145,52 @@ func uploadEncrypt(c *gin.Context) {
 	}
 	defer src.Close()
 
-	// Generate salt and derive key
+	data, err := io.ReadAll(src)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unable to read file"})
+		return
+	}
+
+	// Generate a random salt
 	salt, err := generateRandomBytes(32)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
+	// Derive key from password and salt
 	key, err := deriveKey([]byte(password), salt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "key derivation failed"})
 		return
 	}
 
-	// Set headers for streaming response
+	// Encrypt the data
+	encryptedData, err := encrypt(data, key)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "encryption failed"})
+		return
+	}
+
+	// Combine salt and encrypted data
+	finalData := append(salt, encryptedData...)
+
+	// Create temporary file with random name
+	tempDir := os.TempDir()
+	randomBytes, _ := generateRandomBytes(16)
+	tempFile := filepath.Join(tempDir, hex.EncodeToString(randomBytes))
+	if err := os.WriteFile(tempFile, finalData, 0600); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to save encrypted file"})
+		return
+	}
+	defer os.Remove(tempFile)
+
+	// Send encrypted file
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s.enc", file.Filename))
-	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Transfer-Encoding", "chunked")
-
-	writer := c.Writer
-
-	// Write the salt first
-	if _, err := writer.Write(salt); err != nil {
-		c.Status(http.StatusInternalServerError)
-		return
-	}
-
-	// Generate random IV
-	iv, err := generateRandomBytes(aes.BlockSize)
-	if err != nil {
-		c.Status(http.StatusInternalServerError)
-		return
-	}
-
-	// Write the IV
-	if _, err := writer.Write(iv); err != nil {
-		c.Status(http.StatusInternalServerError)
-		return
-	}
-
-	// Create the cipher
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		c.Status(http.StatusInternalServerError)
-		return
-	}
-
-	// Create CBC encrypter
-	mode := cipher.NewCBCEncrypter(block, iv)
-
-	// Create buffer for reading
-	buffer := make([]byte, 1024*1024) // 1MB buffer
-	var accumulator []byte
-
-	for {
-		n, err := src.Read(buffer)
-		if err != nil && err != io.EOF {
-			c.Status(http.StatusInternalServerError)
-			return
-		}
-
-		if n > 0 {
-			accumulator = append(accumulator, buffer[:n]...)
-		}
-
-		// Process full blocks, leaving any partial block in accumulator
-		for len(accumulator) >= aes.BlockSize {
-			chunk := accumulator[:aes.BlockSize]
-			encrypted := make([]byte, aes.BlockSize)
-			mode.CryptBlocks(encrypted, chunk)
-			if _, err := writer.Write(encrypted); err != nil {
-				c.Status(http.StatusInternalServerError)
-				return
-			}
-			accumulator = accumulator[aes.BlockSize:]
-		}
-
-		if err == io.EOF {
-			// Pad and encrypt the final block
-			if len(accumulator) > 0 || len(accumulator) == 0 {
-				paddedData := pad(accumulator)
-				encrypted := make([]byte, len(paddedData))
-				mode.CryptBlocks(encrypted, paddedData)
-				if _, err := writer.Write(encrypted); err != nil {
-					c.Status(http.StatusInternalServerError)
-					return
-				}
-			}
-			break
-		}
-	}
-
-	writer.Flush()
+	c.File(tempFile)
 }
 
-// uploadDecrypt handles file decryption
-func uploadDecrypt(c *gin.Context) {
+func decryptFile(c *gin.Context) {
 	password := c.GetHeader("X-Encryption-Password")
 	if password == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "decryption password required"})
@@ -198,6 +203,11 @@ func uploadDecrypt(c *gin.Context) {
 		return
 	}
 
+	if file.Size > 50*1024*1024 { // 50MB limit
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file too large"})
+		return
+	}
+
 	src, err := file.Open()
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unable to open file"})
@@ -205,76 +215,48 @@ func uploadDecrypt(c *gin.Context) {
 	}
 	defer src.Close()
 
-	// Read salt
-	salt := make([]byte, 32)
-	if _, err := io.ReadFull(src, salt); err != nil {
+	data, err := io.ReadAll(src)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unable to read file"})
+		return
+	}
+
+	if len(data) < 32 { // Salt size
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid encrypted file"})
 		return
 	}
 
-	// Derive key
+	// Extract salt and derive key
+	salt := data[:32]
+	encryptedData := data[32:]
+
 	key, err := deriveKey([]byte(password), salt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "key derivation failed"})
 		return
 	}
 
-	// Read IV
-	iv := make([]byte, aes.BlockSize)
-	if _, err := io.ReadFull(src, iv); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid encrypted file"})
-		return
-	}
-
-	// Create cipher
-	block, err := aes.NewCipher(key)
+	// Decrypt the data
+	decryptedData, err := decrypt(encryptedData, key)
 	if err != nil {
-		c.Status(http.StatusInternalServerError)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "decryption failed"})
 		return
 	}
 
-	// Create CBC decrypter
-	mode := cipher.NewCBCDecrypter(block, iv)
+	// Create temporary file with random name
+	tempDir := os.TempDir()
+	randomBytes, _ := generateRandomBytes(16)
+	tempFile := filepath.Join(tempDir, hex.EncodeToString(randomBytes))
+	if err := os.WriteFile(tempFile, decryptedData, 0600); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to save decrypted file"})
+		return
+	}
+	defer os.Remove(tempFile)
 
-	// Set headers for streaming response
+	// Send decrypted file
 	originalFilename := strings.TrimSuffix(file.Filename, ".enc")
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", originalFilename))
-	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Transfer-Encoding", "chunked")
-
-	writer := c.Writer
-
-	// Read the entire encrypted content
-	encryptedData, err := io.ReadAll(src)
-	if err != nil {
-		c.Status(http.StatusInternalServerError)
-		return
-	}
-
-	// The data must be a multiple of the block size
-	if len(encryptedData)%aes.BlockSize != 0 {
-		c.Status(http.StatusBadRequest)
-		return
-	}
-
-	// Decrypt all the data
-	decrypted := make([]byte, len(encryptedData))
-	mode.CryptBlocks(decrypted, encryptedData)
-
-	// Remove padding from the decrypted data
-	unpadded, err := unpad(decrypted)
-	if err != nil {
-		c.Status(http.StatusBadRequest)
-		return
-	}
-
-	// Write the decrypted and unpadded data
-	if _, err := writer.Write(unpadded); err != nil {
-		c.Status(http.StatusInternalServerError)
-		return
-	}
-
-	writer.Flush()
+	c.File(tempFile)
 }
 
 func main() {
@@ -298,18 +280,16 @@ func main() {
 	router.GET("/", func(c *gin.Context) {
 		c.String(http.StatusOK, "Secure File Upload/Download Service by babyo7_")
 	})
-	router.POST("/enc", uploadEncrypt)
-	router.POST("/dec", uploadDecrypt)
 
-	// Start server with TLS
-	srv := &http.Server{
-		Addr:    ":8000",
-		Handler: router,
-	}
+	// Set maximum multipart memory
+	router.MaxMultipartMemory = 8 << 20 // 8 MiB
 
-	fmt.Println("Starting secure server on :8443...")
-	if err := srv.ListenAndServe(); err != nil {
-		fmt.Printf("Server error: %v\n", err)
+	router.POST("/enc", encryptFile)
+	router.POST("/dec", decryptFile)
+
+	err := router.Run(":8000")
+	if err != nil {
+		fmt.Printf("Error starting server: %s\n", err)
 		os.Exit(1)
 	}
 }
