@@ -283,7 +283,13 @@ func main() {
 
 	router := gin.Default()
 
-	router.Use(cors.Default()) // This allows all origins, adjust the settings as needed
+	router.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{"*"}, // Allow all origins
+		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "X-Requested-With", "X-Encryption-Password"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true, // Optionally allow credentials if needed
+	}))
 
 	// Set maximum multipart memory
 	router.MaxMultipartMemory = 8 << 20 // 8 MiB
