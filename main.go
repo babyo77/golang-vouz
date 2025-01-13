@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/scrypt"
 )
@@ -281,6 +282,8 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 
 	router := gin.Default()
+
+	router.Use(cors.Default()) // This allows all origins, adjust the settings as needed
 
 	// Set maximum multipart memory
 	router.MaxMultipartMemory = 8 << 20 // 8 MiB
