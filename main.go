@@ -294,7 +294,7 @@ func main() {
 
 	// Start server with TLS
 	srv := &http.Server{
-		Addr:    ":8443",
+		Addr:    ":8000",
 		Handler: router,
 	}
 
