@@ -286,6 +286,9 @@ func main() {
 	router.MaxMultipartMemory = 8 << 20 // 8 MiB
 
 	// Register routes with new handler names
+	router.GET("/", func(c *gin.Context) {
+		c.String(http.StatusOK, "Secure File Upload/Download Service by babyo7_")
+	})
 	router.POST("/enc", uploadEncrypt)
 	router.POST("/dec", uploadDecrypt)
 
