@@ -12,7 +12,7 @@ RUN go mod tidy
 COPY . .
 
 # Build the Go app
-RUN go build -o main .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o main .
 
 # Step 2: Create a minimal runtime image
 FROM debian:bullseye-slim
